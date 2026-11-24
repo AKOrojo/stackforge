@@ -1,5 +1,6 @@
 """Type stubs for the stackforge native Rust extension."""
 
+import os
 from typing import Any, Callable, Iterator, Optional, Union
 
 class LayerKind:
@@ -1209,6 +1210,31 @@ class DhcpServerAM:
 # ---------------------------------------------------------------------------
 # Top-level I/O functions
 # ---------------------------------------------------------------------------
+
+def read_pcap_columns(
+    path: str | os.PathLike[str],
+    n_threads: int | None = None,
+    chunk_mb: int = 8,
+    release_pages: bool = True,
+) -> tuple[dict[str, "numpy.ndarray"], dict[str, Any]]:
+    """Parallel columnar reader for classic pcap (IPv4 TCP/UDP/ICMP packet table).
+
+    Memory-maps the file, walks record headers once, and decodes chunks of
+    records on ``n_threads`` threads with the GIL released. Decoding follows
+    dpkt 1.9.8 semantics exactly (see the Rust docs of
+    ``stackforge_core::pcap::columns``).
+
+    Returns ``(columns, meta)``: ``columns`` maps ts_us, src, dst, sport,
+    dport, proto, ip_len, hdr_len, payload, flags, win, icmp_type, icmp_code
+    (in that order) to numpy arrays; ``meta`` holds ``dropped`` (non_ip, ipv6,
+    other_l4, fragment, parse_error), ``total_seen``, ``truncated``,
+    ``truncation``, ``linktype``, ``ts_resolution``, ``bytes_consumed``,
+    ``file_size``, ``n_chunks``, ``n_threads``.
+
+    Raises:
+        IOError: unreadable file, invalid magic, or pcapng input.
+    """
+    ...
 
 def rdpcap(filename: str, count: int = 0) -> list[PcapPacket]:
     """Read packets from a PCAP or PcapNG file.

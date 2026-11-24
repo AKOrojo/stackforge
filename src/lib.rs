@@ -4012,6 +4012,89 @@ fn rdpcap(filename: &str, count: usize) -> PyResult<Vec<PyPcapPacket>> {
     Ok(results)
 }
 
+/// Read a classic pcap into a columnar IPv4 TCP/UDP/ICMP packet table, in parallel.
+///
+/// The file is memory-mapped, its record headers are walked once, and chunks
+/// of records are decoded on a private pool of `n_threads` worker threads
+/// with the GIL released. Decoding follows dpkt 1.9.8 semantics exactly
+/// (Ethernet incl. 802.1Q/QinQ/MPLS; raw IPv4 for other link types; IPv4 only;
+/// non-first fragments dropped; L4 chosen by the IPv4 protocol field;
+/// `payload = max(0, ip_len - ihl - l4hdr)`; `ts_us = round(ts * 1e6)`).
+///
+/// Args:
+///     path: Path to a classic pcap file (micro/nanosecond, either byte order).
+///     n_threads: Worker threads (default: all CPUs available to the process).
+///     chunk_mb: Capture megabytes per parallel work item.
+///     release_pages: Unmap file pages after each chunk is decoded (keeps RSS
+///         small on multi-GB captures; does not evict the page cache).
+///
+/// Returns:
+///     (columns, meta): `columns` maps the 13 column names (in table order:
+///     ts_us int64, src uint32, dst uint32, sport uint16, dport uint16,
+///     proto uint8, ip_len int32, hdr_len int16, payload int32, flags uint8,
+///     win uint16, icmp_type uint8, icmp_code uint8) to 1-D numpy arrays in
+///     capture order. `meta` holds `dropped` (dict: non_ip, ipv6, other_l4,
+///     fragment, parse_error), `total_seen`, `truncated`, `truncation`,
+///     `linktype`, `ts_resolution`, `bytes_consumed`, `file_size`,
+///     `n_chunks`, `n_threads`.
+///
+/// Raises:
+///     IOError: unreadable file, bad magic, or pcapng input.
+#[pyfunction]
+#[pyo3(signature = (path, n_threads=None, chunk_mb=8, release_pages=true))]
+fn read_pcap_columns<'py>(
+    py: Python<'py>,
+    path: std::path::PathBuf,
+    n_threads: Option<usize>,
+    chunk_mb: usize,
+    release_pages: bool,
+) -> PyResult<(
+    Bound<'py, pyo3::types::PyDict>,
+    Bound<'py, pyo3::types::PyDict>,
+)> {
+    use numpy::IntoPyArray;
+    use pyo3::types::PyDict;
+    let opts = stackforge_core::ColumnReaderOptions {
+        n_threads,
+        chunk_bytes: chunk_mb.max(1) << 20,
+        release_pages,
+    };
+    let t = py
+        .detach(|| stackforge_core::read_pcap_columns_with(&path, opts))
+        .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("{e}")))?;
+    let c = t.columns;
+    let cols = PyDict::new(py);
+    cols.set_item("ts_us", c.ts_us.into_pyarray(py))?;
+    cols.set_item("src", c.src.into_pyarray(py))?;
+    cols.set_item("dst", c.dst.into_pyarray(py))?;
+    cols.set_item("sport", c.sport.into_pyarray(py))?;
+    cols.set_item("dport", c.dport.into_pyarray(py))?;
+    cols.set_item("proto", c.proto.into_pyarray(py))?;
+    cols.set_item("ip_len", c.ip_len.into_pyarray(py))?;
+    cols.set_item("hdr_len", c.hdr_len.into_pyarray(py))?;
+    cols.set_item("payload", c.payload.into_pyarray(py))?;
+    cols.set_item("flags", c.flags.into_pyarray(py))?;
+    cols.set_item("win", c.win.into_pyarray(py))?;
+    cols.set_item("icmp_type", c.icmp_type.into_pyarray(py))?;
+    cols.set_item("icmp_code", c.icmp_code.into_pyarray(py))?;
+    let dropped = PyDict::new(py);
+    for (k, v) in stackforge_core::DROP_NAMES.iter().zip(t.dropped.as_array()) {
+        dropped.set_item(*k, v)?;
+    }
+    let meta = PyDict::new(py);
+    meta.set_item("dropped", dropped)?;
+    meta.set_item("total_seen", t.total_seen)?;
+    meta.set_item("truncated", t.truncated)?;
+    meta.set_item("truncation", t.truncation)?;
+    meta.set_item("linktype", t.linktype)?;
+    meta.set_item("ts_resolution", if t.nanosecond { "ns" } else { "us" })?;
+    meta.set_item("bytes_consumed", t.bytes_consumed)?;
+    meta.set_item("file_size", t.file_size)?;
+    meta.set_item("n_chunks", t.n_chunks)?;
+    meta.set_item("n_threads", t.n_threads)?;
+    Ok((cols, meta))
+}
+
 /// Write packets to a PCAP file.
 ///
 /// Args:
@@ -5371,6 +5454,7 @@ fn stackforge(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyPcapPacket>()?;
     m.add_class::<PyPcapReader>()?;
     m.add_function(wrap_pyfunction!(rdpcap, m)?)?;
+    m.add_function(wrap_pyfunction!(read_pcap_columns, m)?)?;
     m.add_function(wrap_pyfunction!(wrpcap, m)?)?;
     m.add_function(wrap_pyfunction!(wrpcapng, m)?)?;
 

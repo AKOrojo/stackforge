@@ -172,9 +172,10 @@ pub use layer::{
 };
 pub use packet::Packet;
 pub use pcap::{
-    CaptureFormat, CaptureIterator, CapturedPacket, LinkType, MmapPcapReader, PcapIterator,
-    PcapMetadata, PcapNgIterator, PcapNgStreamWriter, rdpcap, wrpcap, wrpcap_packets, wrpcapng,
-    wrpcapng_packets,
+    COLUMN_NAMES, CaptureFormat, CaptureIterator, CapturedPacket, ColumnReaderOptions, DROP_NAMES,
+    DropCounts, LinkType, MmapPcapReader, PacketColumns, PacketTable, PcapIterator, PcapMetadata,
+    PcapNgIterator, PcapNgStreamWriter, rdpcap, read_pcap_columns, read_pcap_columns_with, wrpcap,
+    wrpcap_packets, wrpcapng, wrpcapng_packets,
 };
 
 // Flow extraction re-exports

@@ -58,12 +58,14 @@ from stackforge.stackforge import (
     list_interfaces,
     parse_batch,
     rdpcap,
+    read_pcap_columns,
     sniff,
     validate_filter,
     wrpcap,
     wrpcapng,
 )
 
+from .columns import PACKET_COLUMNS, read_pcap_dataframe
 from .custom import (
     ByteField,
     CustomLayer,
@@ -116,6 +118,9 @@ __all__ = [
     "DNP3",
     # PCAP I/O
     "rdpcap",
+    "read_pcap_columns",
+    "read_pcap_dataframe",
+    "PACKET_COLUMNS",
     "wrpcap",
     "wrpcapng",
     "PcapPacket",

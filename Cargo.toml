@@ -43,6 +43,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 pyo3 = { version = "0.27.2", features = ["extension-module"] }
+numpy = "0.27"
 stackforge-core.workspace = true
 stackforge-automata.workspace = true
 

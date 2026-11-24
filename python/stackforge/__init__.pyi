@@ -45,6 +45,7 @@ from stackforge.stackforge import (
     extract_flows_from_packets as extract_flows_from_packets,
     list_interfaces as list_interfaces,
     rdpcap as rdpcap,
+    read_pcap_columns as read_pcap_columns,
     sniff as sniff,
     validate_filter as validate_filter,
     wrpcap as wrpcap,
