@@ -3939,16 +3939,28 @@ impl PyPcapPacket {
 ///     ...     print(pkt.summary())
 #[pyclass(name = "PcapReader")]
 pub struct PyPcapReader {
-    inner: Option<stackforge_core::CaptureIterator<std::io::BufReader<std::fs::File>>>,
+    inner: Option<PcapReaderInner>,
+}
+
+/// Classic pcap goes through the zero-copy mmap reader; pcapng (or anything
+/// that cannot be mapped) through the streaming reader.
+enum PcapReaderInner {
+    Mmap(stackforge_core::MmapPcapReader),
+    Stream(stackforge_core::CaptureIterator<std::io::BufReader<std::fs::File>>),
 }
 
 #[pymethods]
 impl PyPcapReader {
     #[new]
     fn new(filename: &str) -> PyResult<Self> {
-        let iter = stackforge_core::CaptureIterator::open(filename)
-            .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("{e}")))?;
-        Ok(Self { inner: Some(iter) })
+        let inner = match stackforge_core::MmapPcapReader::open(filename) {
+            Ok(r) => PcapReaderInner::Mmap(r),
+            Err(_) => PcapReaderInner::Stream(
+                stackforge_core::CaptureIterator::open(filename)
+                    .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("{e}")))?,
+            ),
+        };
+        Ok(Self { inner: Some(inner) })
     }
 
     fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
@@ -3956,14 +3968,15 @@ impl PyPcapReader {
     }
 
     fn __next__(mut slf: PyRefMut<'_, Self>) -> PyResult<Option<PyPcapPacket>> {
-        if let Some(ref mut iter) = slf.inner {
-            match iter.next() {
-                Some(Ok(cap)) => Ok(Some(PyPcapPacket { inner: cap })),
-                Some(Err(e)) => Err(pyo3::exceptions::PyIOError::new_err(format!("{e}"))),
-                None => Ok(None),
-            }
-        } else {
-            Ok(None)
+        let next = match slf.inner.as_mut() {
+            Some(PcapReaderInner::Mmap(r)) => r.next(),
+            Some(PcapReaderInner::Stream(r)) => r.next(),
+            None => None,
+        };
+        match next {
+            Some(Ok(cap)) => Ok(Some(PyPcapPacket { inner: cap })),
+            Some(Err(e)) => Err(pyo3::exceptions::PyIOError::new_err(format!("{e}"))),
+            None => Ok(None),
         }
     }
 }

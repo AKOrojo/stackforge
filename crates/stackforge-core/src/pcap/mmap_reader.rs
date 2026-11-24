@@ -7,6 +7,7 @@
 //! [`super::CaptureIterator`] instead.
 
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -22,6 +23,19 @@ const PCAP_GLOBAL_HEADER_LEN: usize = 24;
 
 /// PCAP per-packet record header size in bytes.
 const PCAP_RECORD_HEADER_LEN: usize = 16;
+
+/// Consumed bytes between two `MADV_DONTNEED` calls (see [`MmapPcapReader`]).
+const RELEASE_STRIDE: usize = 64 << 20;
+
+/// `Bytes` owner that keeps the mapping alive and lets the reader advise it.
+#[derive(Debug)]
+struct SharedMmap(Arc<Mmap>);
+
+impl AsRef<[u8]> for SharedMmap {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
 
 /// PCAP magic numbers.
 const MAGIC_USEC: u32 = 0xA1B2_C3D4;
@@ -65,6 +79,10 @@ pub struct MmapPcapReader {
     endian: PcapEndian,
     /// Link-layer type from the global header.
     link_type: LinkType,
+    /// The mapping itself (also owned by `data`), for `madvise`.
+    map: Arc<Mmap>,
+    /// File offset up to which pages have been released.
+    released: usize,
 }
 
 impl MmapPcapReader {
@@ -119,15 +137,18 @@ impl MmapPcapReader {
         // Network (link type) field is at global header offset 20.
         let network = read_u32_endian(raw, 20, endian);
 
-        // Transfer ownership of the mmap into a Bytes so `.slice()` calls are
-        // zero-copy reference-counted views.
-        let data = Bytes::from_owner(mmap);
+        // Share the mmap with a Bytes so `.slice()` calls are zero-copy
+        // reference-counted views.
+        let map = Arc::new(mmap);
+        let data = Bytes::from_owner(SharedMmap(Arc::clone(&map)));
 
         Ok(Self {
             data,
             offset: PCAP_GLOBAL_HEADER_LEN,
             endian,
             link_type: LinkType(network),
+            map,
+            released: 0,
         })
     }
 
@@ -141,6 +162,31 @@ impl MmapPcapReader {
     #[inline]
     pub fn file_len(&self) -> usize {
         self.data.len()
+    }
+}
+
+impl MmapPcapReader {
+    /// Unmap the already-consumed part of the file from this process so that
+    /// a streaming pass over a multi-GB capture does not grow RSS by the file
+    /// size. Packets still referencing those bytes stay valid: the mapping is
+    /// read-only and file-backed, so a later access re-faults the same data
+    /// from the page cache.
+    fn release_consumed(&mut self) {
+        const PAGE: usize = 4096;
+        let end = self.offset / PAGE * PAGE;
+        if end > self.released {
+            #[cfg(unix)]
+            // SAFETY: see above; MADV_DONTNEED on a read-only file mapping
+            // never changes the observed contents.
+            unsafe {
+                let _ = self.map.unchecked_advise_range(
+                    memmap2::UncheckedAdvice::DontNeed,
+                    self.released,
+                    end - self.released,
+                );
+            }
+            self.released = end;
+        }
     }
 }
 
@@ -200,6 +246,9 @@ impl Iterator for MmapPcapReader {
         };
 
         self.offset = data_end;
+        if self.offset - self.released >= RELEASE_STRIDE {
+            self.release_consumed();
+        }
 
         Some(Ok(CapturedPacket {
             packet: pkt,
