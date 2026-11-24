@@ -1,8 +1,9 @@
 //! Parallel, columnar classic-PCAP reader producing a flow-feature packet table.
 //!
-//! [`read_pcap_columns`] memory-maps a capture, walks the record headers once
-//! (classic PCAP has no index), cuts the record stream into chunks and decodes
-//! the chunks in parallel on a private Rayon pool. Each packet becomes one row
+//! [`read_pcap_columns`] memory-maps a capture, cuts it into byte ranges and
+//! decodes the ranges in parallel on a private Rayon pool (classic PCAP has
+//! no index: each worker resynchronises on a record boundary and a serial
+//! check proves the chunks tile the true record chain; see the driver). Each packet becomes one row
 //! of 13 fixed-width columns (see [`COLUMN_NAMES`]); packets that are not
 //! IPv4 TCP/UDP/ICMP are counted by drop reason instead.
 //!
@@ -36,7 +37,6 @@
 
 use std::fs::File;
 use std::path::Path;
-use std::sync::Mutex;
 
 use memmap2::Mmap;
 
@@ -187,8 +187,10 @@ pub struct PacketTable {
     pub bytes_consumed: u64,
     /// File size in bytes.
     pub file_size: u64,
-    /// Number of chunks decoded in parallel.
+    /// Number of byte-range chunks decoded in parallel.
     pub n_chunks: usize,
+    /// Chunks whose boundary guess was wrong and were re-decoded serially.
+    pub chunks_redecoded: usize,
     /// Worker threads used.
     pub n_threads: usize,
 }
@@ -676,11 +678,21 @@ enum Outcome {
 #[inline]
 fn classify(buf: &[u8], linktype: u32) -> Outcome {
     let ip = if linktype == 1 {
-        match ethernet(buf) {
-            Err(_) => return Outcome::ParseError,
-            Ok(Data::Ip6) => return Outcome::Ipv6,
-            Ok(Data::Ip(ip)) => ip,
-            Ok(_) => return Outcome::NonIp,
+        // Fast path, equivalent to the general one: for EtherType 0x0800 the
+        // dispatch is IP(buf[14:]); on UnpackError .data stays bytes and the
+        // __init__ re-dispatch fails identically, i.e. "not IP".
+        if buf.len() >= 14 && buf[12] == 0x08 && buf[13] == 0x00 {
+            match ip4(&buf[14..]) {
+                Some(ip) => ip,
+                None => return Outcome::NonIp,
+            }
+        } else {
+            match ethernet(buf) {
+                Err(_) => return Outcome::ParseError,
+                Ok(Data::Ip6) => return Outcome::Ipv6,
+                Ok(Data::Ip(ip)) => ip,
+                Ok(_) => return Outcome::NonIp,
+            }
         }
     } else {
         match ip4(buf) {
@@ -750,38 +762,63 @@ fn classify(buf: &[u8], linktype: u32) -> Outcome {
 }
 
 // ---------------------------------------------------------------------------
-// Chunked parallel driver
+// Parallel driver: split by bytes, resync, decode, verify
 // ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, Copy)]
-struct Chunk {
-    start: usize,
-    end: usize,
-    n_records: usize,
-}
+//
+// Classic pcap has no index, and a serial header walk over a multi-GB file
+// is itself several seconds of page faults and dependent loads. Instead the
+// file is cut into fixed byte ranges; each worker finds a plausible record
+// boundary in its range (`resync`) and decodes every record that *starts*
+// inside the range, stopping at the first record boundary at or past the
+// range end. Correctness never depends on the resync heuristic: a serial
+// pass then checks, by induction from the true first record at offset 24,
+// that every chunk started exactly where the previous chunk's record chain
+// ended, and re-decodes any chunk that did not.
 
 struct ChunkOut {
+    /// Offset of the first record decoded.
+    start: usize,
+    /// Offset just past the last record decoded.
+    end: usize,
     cols: PacketColumns,
     dropped: DropCounts,
     seen: u64,
+    truncation: Option<String>,
 }
 
-fn decode_chunk(raw: &[u8], fmt: Format, c: Chunk) -> ChunkOut {
-    let mut cols = PacketColumns::with_capacity(c.n_records);
+/// Records whose header starts in `[start, stop)`, following the chain from `start`.
+fn decode_range(raw: &[u8], fmt: Format, start: usize, stop: usize) -> ChunkOut {
+    let cap = (stop.saturating_sub(start)) / 64 + 16;
+    let mut cols = PacketColumns::with_capacity(cap);
     let mut dropped = DropCounts::default();
-    let mut off = c.start;
+    let mut truncation = None;
+    let mut off = start;
     let mut seen = 0u64;
-    while off < c.end {
-        // The walker guarantees a complete record header here.
+    let h = fmt.rec_hdr_len;
+    while off < stop {
+        let rem = raw.len() - off;
+        if rem < h {
+            truncation = Some(format!(
+                "capture ends inside a record header at offset {off} ({rem} of {h} bytes)"
+            ));
+            break;
+        }
         let sec = rd32(raw, off, fmt.little);
         let frac = rd32(raw, off + 4, fmt.little);
         let caplen = rd32(raw, off + 8, fmt.little) as usize;
-        let ds = off + fmt.rec_hdr_len;
-        let de = ds.saturating_add(caplen).min(raw.len());
-        let buf = &raw[ds..de];
-        off = de;
+        let ds = off + h;
+        let avail = raw.len() - ds;
+        let de = if caplen > avail {
+            truncation = Some(format!(
+                "last record at offset {off} claims {caplen} bytes but only {avail} remain; \
+                 decoded from the bytes present"
+            ));
+            raw.len()
+        } else {
+            ds + caplen
+        };
         seen += 1;
-        match classify(buf, fmt.linktype) {
+        match classify(&raw[ds..de], fmt.linktype) {
             Outcome::Row(r) => cols.push(ts_to_us(sec, frac, fmt.nano), &r),
             Outcome::NonIp => dropped.non_ip += 1,
             Outcome::Ipv6 => dropped.ipv6 += 1,
@@ -789,12 +826,67 @@ fn decode_chunk(raw: &[u8], fmt: Format, c: Chunk) -> ChunkOut {
             Outcome::Fragment => dropped.fragment += 1,
             Outcome::ParseError => dropped.parse_error += 1,
         }
+        off = de;
+        if truncation.is_some() {
+            break;
+        }
     }
     ChunkOut {
+        start,
+        end: off,
         cols,
         dropped,
         seen,
+        truncation,
     }
+}
+
+/// Header at `off` looks like a real record: returns the next record offset.
+#[inline]
+fn plausible(raw: &[u8], fmt: Format, off: usize, cap_max: usize, sec_ref: u32) -> Option<usize> {
+    if off + fmt.rec_hdr_len > raw.len() {
+        return None;
+    }
+    // Within ~400 days of the first record: rejects fake "headers" inside
+    // runs of identical packets, which chain consistently otherwise.
+    if rd32(raw, off, fmt.little).abs_diff(sec_ref) > 400 * 86_400 {
+        return None;
+    }
+    let frac = rd32(raw, off + 4, fmt.little);
+    let caplen = rd32(raw, off + 8, fmt.little) as usize;
+    let orig = rd32(raw, off + 12, fmt.little) as usize;
+    let frac_max = if fmt.nano { 1_000_000_000 } else { 1_000_000 };
+    if frac >= frac_max || caplen > cap_max || caplen > orig {
+        return None;
+    }
+    let next = off + fmt.rec_hdr_len + caplen;
+    (next <= raw.len()).then_some(next)
+}
+
+/// First offset in `[from, to)` that starts a chain of 8 plausible records
+/// (or a shorter chain ending exactly at end-of-file).
+fn resync(
+    raw: &[u8],
+    fmt: Format,
+    from: usize,
+    to: usize,
+    cap_max: usize,
+    sec_ref: u32,
+) -> Option<usize> {
+    'cand: for o in from..to {
+        let mut p = o;
+        for _ in 0..8 {
+            if p == raw.len() {
+                break;
+            }
+            match plausible(raw, fmt, p, cap_max, sec_ref) {
+                Some(n) => p = n,
+                None => continue 'cand,
+            }
+        }
+        return Some(o);
+    }
+    None
 }
 
 #[cfg(unix)]
@@ -847,28 +939,6 @@ fn concat<T: Copy + Send + Sync>(
     out
 }
 
-fn spawn_chunk<'s>(
-    s: &rayon::Scope<'s>,
-    slots: &'s Mutex<Vec<Option<ChunkOut>>>,
-    mmap: &'s Mmap,
-    fmt: Format,
-    release_pages: bool,
-    idx: usize,
-    c: Chunk,
-) {
-    s.spawn(move |_| {
-        let out = decode_chunk(mmap, fmt, c);
-        if release_pages {
-            release(mmap, c.start, c.end);
-        }
-        let mut g = slots.lock().unwrap();
-        if g.len() <= idx {
-            g.resize_with(idx + 1, || None);
-        }
-        g[idx] = Some(out);
-    });
-}
-
 /// Read a classic pcap into the 13-column packet table (see module docs).
 pub fn read_pcap_columns(path: impl AsRef<Path>, n_threads: Option<usize>) -> Result<PacketTable> {
     read_pcap_columns_with(
@@ -891,10 +961,14 @@ pub fn read_pcap_columns_with(
     // SAFETY: read-only mapping; the capture must not be modified while read.
     let mmap = unsafe { Mmap::map(&file) }
         .map_err(|e| PacketError::Io(format!("failed to mmap {}: {e}", path.display())))?;
-    #[cfg(unix)]
-    let _ = mmap.advise(memmap2::Advice::Sequential);
     let raw: &[u8] = &mmap;
     let fmt = parse_global_header(raw)?;
+    let snaplen = rd32(raw, 16, fmt.little) as usize;
+    let cap_max = if (1..=(1 << 20)).contains(&snaplen) {
+        snaplen.max(65_535)
+    } else {
+        262_144
+    };
 
     let n_threads = opts
         .n_threads
@@ -906,91 +980,92 @@ pub fn read_pcap_columns_with(
         .build()
         .map_err(|e| PacketError::Io(format!("failed to build thread pool: {e}")))?;
 
+    let timing = std::env::var_os("STACKFORGE_COLUMNS_TIMING").is_some();
+    let t0 = std::time::Instant::now();
+
+    // Byte ranges [bounds[i], bounds[i+1]).
     let chunk_bytes = opts.chunk_bytes.max(1 << 16);
-    let slots: Mutex<Vec<Option<ChunkOut>>> = Mutex::new(Vec::new());
-    let mut truncation: Option<String> = None;
-    let mut consumed = 24usize;
-    let mut n_chunks = 0usize;
+    let mut bounds: Vec<usize> = (24..raw.len()).step_by(chunk_bytes).collect();
+    bounds.push(raw.len());
+    let n_ranges = bounds.len() - 1;
 
-    // The walker runs on one pool thread and hands each chunk to the pool as
-    // soon as its extent is known, so walking and decoding overlap.
+    let sec_ref = if raw.len() >= 28 {
+        rd32(raw, 24, fmt.little)
+    } else {
+        0
+    };
+    // Workers take chunks in file order (atomic counter) so that all threads
+    // read neighbouring regions: friendlier to readahead on a cold cache than
+    // rayon's recursive range splitting.
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let slots: Vec<std::sync::OnceLock<Option<ChunkOut>>> =
+        (0..n_ranges).map(|_| std::sync::OnceLock::new()).collect();
     pool.scope(|s| {
-        let mut off = 24usize;
-        let mut cstart = off;
-        let mut cn = 0usize;
-        let mut idx = 0usize;
-        let (slots, mmap, rp) = (&slots, &mmap, opts.release_pages);
-        loop {
-            let rem = raw.len() - off;
-            if rem == 0 {
-                break;
-            }
-            if rem < fmt.rec_hdr_len {
-                truncation = Some(format!(
-                    "capture ends inside a record header at offset {off} ({rem} of {} bytes)",
-                    fmt.rec_hdr_len
-                ));
-                break;
-            }
-            let caplen = rd32(raw, off + 8, fmt.little) as usize;
-            let ds = off + fmt.rec_hdr_len;
-            let avail = raw.len() - ds;
-            if caplen > avail {
-                truncation = Some(format!(
-                    "last record at offset {off} claims {caplen} bytes but only {avail} remain; \
-                     decoded from the bytes present"
-                ));
-                off = raw.len();
-                cn += 1;
-                break;
-            }
-            off = ds + caplen;
-            cn += 1;
-            if off - cstart >= chunk_bytes {
-                spawn_chunk(
-                    s,
-                    slots,
-                    mmap,
-                    fmt,
-                    rp,
-                    idx,
-                    Chunk {
-                        start: cstart,
-                        end: off,
-                        n_records: cn,
-                    },
-                );
-                idx += 1;
-                cstart = off;
-                cn = 0;
-            }
+        for _ in 0..n_threads {
+            s.spawn(|_| {
+                loop {
+                    let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if i >= n_ranges {
+                        break;
+                    }
+                    let (a, b) = (bounds[i], bounds[i + 1]);
+                    let st = if i == 0 {
+                        Some(a)
+                    } else {
+                        resync(raw, fmt, a, b, cap_max, sec_ref)
+                    };
+                    let out = st.map(|st| decode_range(raw, fmt, st, b));
+                    if opts.release_pages {
+                        release(&mmap, a, b);
+                    }
+                    let _ = slots[i].set(out);
+                }
+            });
         }
-        if cn > 0 {
-            spawn_chunk(
-                s,
-                slots,
-                mmap,
-                fmt,
-                rp,
-                idx,
-                Chunk {
-                    start: cstart,
-                    end: off,
-                    n_records: cn,
-                },
-            );
-            idx += 1;
-        }
-        consumed = off;
-        n_chunks = idx;
     });
-
-    let mut parts: Vec<ChunkOut> = slots
-        .into_inner()
-        .unwrap()
+    let mut parts: Vec<Option<ChunkOut>> = slots
         .into_iter()
-        .map(|o| o.expect("chunk decoded"))
+        .map(|c| c.into_inner().expect("every chunk visited"))
         .collect();
+    let t_decode = t0.elapsed().as_secs_f64();
+
+    // Verify the chain; re-decode chunks that started at the wrong offset.
+    let mut expected = 24usize;
+    let mut redone = 0usize;
+    let mut truncation: Option<String> = None;
+    for i in 0..n_ranges {
+        if truncation.is_some() || expected >= raw.len() {
+            parts[i] = None;
+            continue;
+        }
+        if !matches!(&parts[i], Some(c) if c.start == expected) {
+            if timing && redone < 8 {
+                let got = parts[i].as_ref().map(|c| c.start);
+                let why = (0..8).try_fold(expected, |p, _| {
+                    if p == raw.len() {
+                        Ok(p)
+                    } else {
+                        plausible(raw, fmt, p, cap_max, sec_ref).ok_or(p)
+                    }
+                });
+                eprintln!(
+                    "  chunk {i}: range start {} resync {got:?} expected {expected} chain-from-expected {why:?} hdr@fail {:?}",
+                    bounds[i],
+                    why.err().map(|p| (0..4)
+                        .map(|k| rd32(raw, p + 4 * k, fmt.little))
+                        .collect::<Vec<_>>())
+                );
+            }
+            parts[i] = Some(decode_range(raw, fmt, expected, bounds[i + 1]));
+            redone += 1;
+        }
+        let c = parts[i].as_mut().expect("chunk present");
+        expected = c.end;
+        truncation = c.truncation.take();
+    }
+    let mut parts: Vec<ChunkOut> = parts.into_iter().flatten().collect();
+    let t_verify = t0.elapsed().as_secs_f64();
+
     let mut dropped = DropCounts::default();
     let mut seen = 0u64;
     let mut total = 0usize;
@@ -999,37 +1074,29 @@ pub fn read_pcap_columns_with(
         seen += p.seen;
         total += p.cols.len();
     }
-    let columns = pool.install(|| {
-        let ts_us = concat(&mut parts, total, |c| &mut c.ts_us);
-        let src = concat(&mut parts, total, |c| &mut c.src);
-        let dst = concat(&mut parts, total, |c| &mut c.dst);
-        let sport = concat(&mut parts, total, |c| &mut c.sport);
-        let dport = concat(&mut parts, total, |c| &mut c.dport);
-        let proto = concat(&mut parts, total, |c| &mut c.proto);
-        let ip_len = concat(&mut parts, total, |c| &mut c.ip_len);
-        let hdr_len = concat(&mut parts, total, |c| &mut c.hdr_len);
-        let payload = concat(&mut parts, total, |c| &mut c.payload);
-        let flags = concat(&mut parts, total, |c| &mut c.flags);
-        let win = concat(&mut parts, total, |c| &mut c.win);
-        let icmp_type = concat(&mut parts, total, |c| &mut c.icmp_type);
-        let icmp_code = concat(&mut parts, total, |c| &mut c.icmp_code);
-        PacketColumns {
-            ts_us,
-            src,
-            dst,
-            sport,
-            dport,
-            proto,
-            ip_len,
-            hdr_len,
-            payload,
-            flags,
-            win,
-            icmp_type,
-            icmp_code,
-        }
+    let columns = pool.install(|| PacketColumns {
+        ts_us: concat(&mut parts, total, |c| &mut c.ts_us),
+        src: concat(&mut parts, total, |c| &mut c.src),
+        dst: concat(&mut parts, total, |c| &mut c.dst),
+        sport: concat(&mut parts, total, |c| &mut c.sport),
+        dport: concat(&mut parts, total, |c| &mut c.dport),
+        proto: concat(&mut parts, total, |c| &mut c.proto),
+        ip_len: concat(&mut parts, total, |c| &mut c.ip_len),
+        hdr_len: concat(&mut parts, total, |c| &mut c.hdr_len),
+        payload: concat(&mut parts, total, |c| &mut c.payload),
+        flags: concat(&mut parts, total, |c| &mut c.flags),
+        win: concat(&mut parts, total, |c| &mut c.win),
+        icmp_type: concat(&mut parts, total, |c| &mut c.icmp_type),
+        icmp_code: concat(&mut parts, total, |c| &mut c.icmp_code),
     });
-
+    if timing {
+        eprintln!(
+            "read_pcap_columns: decode {t_decode:.3}s, verify {:.3}s ({redone} of {n_ranges} \
+             chunks re-decoded), concat {:.3}s, rows {total}, threads {n_threads}",
+            t_verify - t_decode,
+            t0.elapsed().as_secs_f64() - t_verify
+        );
+    }
     Ok(PacketTable {
         columns,
         dropped,
@@ -1038,9 +1105,10 @@ pub fn read_pcap_columns_with(
         truncation,
         linktype: fmt.linktype,
         nanosecond: fmt.nano,
-        bytes_consumed: consumed as u64,
+        bytes_consumed: expected.min(raw.len()) as u64,
         file_size: raw.len() as u64,
-        n_chunks,
+        n_chunks: n_ranges,
+        chunks_redecoded: redone,
         n_threads,
     })
 }
@@ -1213,6 +1281,77 @@ mod tests {
         let t = read(&full[..first_end + 7], 1);
         assert!(t.truncated);
         assert_eq!(t.total_seen, 1);
+    }
+
+    /// Many chunks: the parallel result must equal one serial decode, both
+    /// when resync finds the true boundaries and when it cannot (all chunks
+    /// re-decoded), and whatever the thread count.
+    #[test]
+    fn parallel_chunks_match_serial_decode() {
+        let mut recs = Vec::new();
+        let mut x: u32 = 12345;
+        for i in 0..40_000u32 {
+            x = x.wrapping_mul(1_103_515_245).wrapping_add(12345);
+            let n = (x >> 16) as usize % 300;
+            // Payload bytes that look like record headers, to provoke false syncs.
+            let mut pl = tcp(1000 + (i % 7) as u16, 80, 0x18, 1024, 0);
+            for k in 0..n {
+                pl.push(if k % 16 < 8 { 0 } else { (x >> (k % 24)) as u8 });
+            }
+            recs.push((
+                1_519_000_000 + i,
+                (x % 1_000_000),
+                eth(0x0800, &ipv4(6, &pl, 0)),
+            ));
+            if i % 97 == 0 {
+                recs.push((1_519_000_000 + i, 1, eth(0x0806, &[0u8; 28])));
+            }
+        }
+        let bytes = pcap(true, false, &recs);
+        assert!(bytes.len() > 20 * 65_536);
+        let fmt = parse_global_header(&bytes).unwrap();
+        let serial = decode_range(&bytes, fmt, 24, bytes.len());
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("big.pcap");
+        std::fs::write(&p, &bytes).unwrap();
+        for threads in [1, 2, 7] {
+            let t = read_pcap_columns_with(
+                &p,
+                ColumnReaderOptions {
+                    n_threads: Some(threads),
+                    chunk_bytes: 65_536,
+                    release_pages: true,
+                },
+            )
+            .unwrap();
+            assert!(t.n_chunks > 20);
+            assert_eq!(t.columns, serial.cols);
+            assert_eq!(t.dropped, serial.dropped);
+            assert_eq!(t.total_seen, serial.seen);
+            assert_eq!(t.bytes_consumed as usize, bytes.len());
+        }
+        // orig_len < caplen everywhere: resync never succeeds, every chunk is
+        // re-decoded from the verified offset, the result is unchanged.
+        let mut bad = bytes.clone();
+        let mut off = 24;
+        while off < bad.len() {
+            let cap = u32::from_le_bytes(bad[off + 8..off + 12].try_into().unwrap()) as usize;
+            bad[off + 12..off + 16].copy_from_slice(&0u32.to_le_bytes());
+            off += 16 + cap;
+        }
+        std::fs::write(&p, &bad).unwrap();
+        let t = read_pcap_columns_with(
+            &p,
+            ColumnReaderOptions {
+                n_threads: Some(4),
+                chunk_bytes: 65_536,
+                release_pages: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(t.chunks_redecoded, t.n_chunks - 1);
+        assert_eq!(t.columns, serial.cols);
+        assert_eq!(t.total_seen, serial.seen);
     }
 
     #[test]

@@ -4053,7 +4053,7 @@ fn rdpcap(filename: &str, count: usize) -> PyResult<Vec<PyPcapPacket>> {
 ///     capture order. `meta` holds `dropped` (dict: non_ip, ipv6, other_l4,
 ///     fragment, parse_error), `total_seen`, `truncated`, `truncation`,
 ///     `linktype`, `ts_resolution`, `bytes_consumed`, `file_size`,
-///     `n_chunks`, `n_threads`.
+///     `n_chunks`, `chunks_redecoded`, `n_threads`.
 ///
 /// Raises:
 ///     IOError: unreadable file, bad magic, or pcapng input.
@@ -4108,6 +4108,7 @@ fn read_pcap_columns<'py>(
     meta.set_item("bytes_consumed", t.bytes_consumed)?;
     meta.set_item("file_size", t.file_size)?;
     meta.set_item("n_chunks", t.n_chunks)?;
+    meta.set_item("chunks_redecoded", t.chunks_redecoded)?;
     meta.set_item("n_threads", t.n_threads)?;
     Ok((cols, meta))
 }
