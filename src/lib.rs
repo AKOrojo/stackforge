@@ -627,8 +627,12 @@ impl PyPacket {
         kind: PyLayerKind,
         name: &str,
     ) -> PyResult<Py<PyAny>> {
-        for layer_enum in self.inner.layer_enums() {
-            if layer_enum.kind() == kind.to_rust() {
+        // Build the LayerEnum views lazily instead of collecting all of them
+        // into a Vec on every call (one heap allocation per field access).
+        let want = kind.to_rust();
+        for idx in self.inner.layers() {
+            let layer_enum = self.inner.layer_enum(idx);
+            if layer_enum.kind() == want {
                 if let Some(result) = layer_enum.get_field(self.inner.as_bytes(), name) {
                     return match result {
                         Ok(value) => field_value_to_python(py, value),
