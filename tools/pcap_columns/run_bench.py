@@ -22,6 +22,7 @@ for r in range(int(reps)):
         subprocess.run(["cat", pcap], stdout=subprocess.DEVNULL, check=True)   # make sure it is cached
         resident = -1
     full = ["/usr/bin/time", "-f", "TIME wall=%e maxrss=%M", "taskset", "-c", cpus] + [c.replace("{pcap}", pcap) for c in cmd]
+    load1 = float(open('/proc/loadavg').read().split()[0])
     t0 = time.time()
     p = subprocess.run(full, capture_output=True, text=True)
     m = re.search(r"TIME wall=([\d.]+) maxrss=(\d+)", p.stderr)
@@ -31,7 +32,7 @@ for r in range(int(reps)):
     inner = re.search(r"seconds=([\d.]+)", p.stdout)
     row = dict(label=label, pcap=os.path.basename(pcap), bytes=size, cache=cache, cpus=cpus, rep=r, wall_s=wall,
                inner_s=float(inner.group(1)) if inner else "", maxrss_mb=round(rss / 1024, 1), mb_s=round(size / 1e6 / wall, 1),
-               resident_before=resident, stdout=p.stdout.strip().splitlines()[0][:200] if p.stdout.strip() else "")
+               resident_before=resident, load1=load1, stdout=p.stdout.strip().splitlines()[0][:200] if p.stdout.strip() else "")
     new = not os.path.exists(out_csv)
     with open(out_csv, "a", newline="") as f:
         w = csv.DictWriter(f, fieldnames=list(row)); new and w.writeheader(); w.writerow(row)
