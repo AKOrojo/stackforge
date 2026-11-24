@@ -7,13 +7,20 @@ import random
 import struct
 import sys
 
-seed_path, outdir = sys.argv[1], sys.argv[2]
-N = int(sys.argv[3]) if len(sys.argv) > 3 else 200_000
-rng = random.Random(int(sys.argv[4]) if len(sys.argv) > 4 else 7)
+rng = random.Random(7)
 
 
 def read_seed(path, limit=30000):
     with open(path, "rb") as f:
+        if f.read(4) == b"\x0a\x0d\x0d\x0a":        # pcapng seed: take EPB payloads
+            f.seek(8); e = "<" if f.read(4) == b"\x4d\x3c\x2b\x1a" else ">"; f.seek(0); out = []
+            while len(out) < limit:
+                h = f.read(8)
+                if len(h) < 8: break
+                t, n = struct.unpack(e + "II", h); body = f.read(n - 8)
+                if t == 6: out.append(body[20:20 + struct.unpack(e + "I", body[12:16])[0]])
+            return out
+        f.seek(0)
         gh = f.read(24)
         e = "<" if gh[:4] == b"\xd4\xc3\xb2\xa1" else ">"
         out = []
@@ -25,11 +32,15 @@ def read_seed(path, limit=30000):
     return out
 
 
-base = read_seed(seed_path)
-ipv4_frames = [p for p in base if len(p) > 34 and p[12:14] == b"\x08\x00"]
-ipv6_frames = [p for p in base if len(p) > 54 and p[12:14] == b"\x86\xdd"]
-other_frames = [p for p in base if p[12:14] not in (b"\x08\x00", b"\x86\xdd")]
-print(f"seed: {len(base)} frames, ipv4 {len(ipv4_frames)}, ipv6 {len(ipv6_frames)}, other {len(other_frames)}")
+def init(seed_path, seed):
+    """Load seed frames and seed the RNG (module-level state used by frame())."""
+    global base, ipv4_frames, ipv6_frames, other_frames
+    rng.seed(seed)
+    base = read_seed(seed_path)
+    ipv4_frames = [p for p in base if len(p) > 34 and p[12:14] == b"\x08\x00"]
+    ipv6_frames = [p for p in base if len(p) > 54 and p[12:14] == b"\x86\xdd"]
+    other_frames = [p for p in base if p[12:14] not in (b"\x08\x00", b"\x86\xdd")]
+    print(f"seed: {len(base)} frames, ipv4 {len(ipv4_frames)}, ipv6 {len(ipv6_frames)}, other {len(other_frames)}")
 
 
 def rb(n): return bytes(rng.getrandbits(8) for _ in range(n))
@@ -159,15 +170,19 @@ def write(path, frames, endian, magic, rec24=False, link=1):
             f.write(fr)
 
 
-os.makedirs(outdir, exist_ok=True)
-frames = [(ts(), frame()) for _ in range(N)]
-write(f"{outdir}/fz_be_us.pcap", frames, ">", 0xA1B2C3D4)
-write(f"{outdir}/fz_le_ns.pcap", frames, "<", 0xA1B23C4D)
-write(f"{outdir}/fz_mod.pcap", frames[: N // 4], "<", 0xA1B2CD34, rec24=True)
-raw = [(t, fr[14:] if rng.random() < 0.85 else fr) for t, fr in frames[: N // 2]]
-write(f"{outdir}/fz_raw.pcap", raw, "<", 0xA1B2C3D4, link=101)
-data = open(f"{outdir}/fz_be_us.pcap", "rb").read()
-open(f"{outdir}/fz_trunc_data.pcap", "wb").write(data[: len(data) - 3])        # last record's data cut short
-last = len(data) - (16 + len(frames[-1][1]))
-open(f"{outdir}/fz_trunc_hdr.pcap", "wb").write(data[: last + 9])                 # cut inside the last record header
-print("wrote", N, "frames")
+if __name__ == "__main__":
+    seed_path, outdir = sys.argv[1], sys.argv[2]
+    N = int(sys.argv[3]) if len(sys.argv) > 3 else 200_000
+    init(seed_path, int(sys.argv[4]) if len(sys.argv) > 4 else 7)
+    os.makedirs(outdir, exist_ok=True)
+    frames = [(ts(), frame()) for _ in range(N)]
+    write(f"{outdir}/fz_be_us.pcap", frames, ">", 0xA1B2C3D4)
+    write(f"{outdir}/fz_le_ns.pcap", frames, "<", 0xA1B23C4D)
+    write(f"{outdir}/fz_mod.pcap", frames[: N // 4], "<", 0xA1B2CD34, rec24=True)
+    raw = [(t, fr[14:] if rng.random() < 0.85 else fr) for t, fr in frames[: N // 2]]
+    write(f"{outdir}/fz_raw.pcap", raw, "<", 0xA1B2C3D4, link=101)
+    data = open(f"{outdir}/fz_be_us.pcap", "rb").read()
+    open(f"{outdir}/fz_trunc_data.pcap", "wb").write(data[: len(data) - 3])        # last record's data cut short
+    last = len(data) - (16 + len(frames[-1][1]))
+    open(f"{outdir}/fz_trunc_hdr.pcap", "wb").write(data[: last + 9])                 # cut inside the last record header
+    print("wrote", N, "frames")

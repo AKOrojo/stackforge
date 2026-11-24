@@ -1217,7 +1217,11 @@ def read_pcap_columns(
     chunk_mb: int = 8,
     release_pages: bool = True,
 ) -> tuple[dict[str, "numpy.ndarray"], dict[str, Any]]:
-    """Parallel columnar reader for classic pcap (IPv4 TCP/UDP/ICMP packet table).
+    """Parallel columnar reader for classic pcap and pcapng (IPv4 TCP/UDP/ICMP packet table).
+
+    pcapng is read exactly as dpkt.pcapng.Reader reads it: the first section's
+    byte order and the first IDB's link type / if_tsresol / if_tsoffset apply
+    to every packet; only Enhanced and (obsolete) Packet blocks are yielded.
 
     Memory-maps the file, walks record headers once, and decodes chunks of
     records on ``n_threads`` threads with the GIL released. Decoding follows
@@ -1228,11 +1232,14 @@ def read_pcap_columns(
     dport, proto, ip_len, hdr_len, payload, flags, win, icmp_type, icmp_code
     (in that order) to numpy arrays; ``meta`` holds ``dropped`` (non_ip, ipv6,
     other_l4, fragment, parse_error), ``total_seen``, ``truncated``,
-    ``truncation``, ``linktype``, ``ts_resolution``, ``bytes_consumed``,
-    ``file_size``, ``n_chunks``, ``n_threads``.
+    ``truncation``, ``reference_error`` (set where dpkt would raise instead:
+    classic record header cut by EOF, malformed/truncated pcapng packet block;
+    the table holds the packets before it), ``format``, ``linktype``,
+    ``ts_resolution``, ``ts_divisor``, ``bytes_consumed``, ``file_size``,
+    ``n_chunks``, ``chunks_redecoded``, ``n_threads``.
 
     Raises:
-        IOError: unreadable file, invalid magic, or pcapng input.
+        IOError: unreadable file, invalid magic, or a pcapng header dpkt rejects.
     """
     ...
 

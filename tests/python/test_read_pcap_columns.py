@@ -73,7 +73,32 @@ def test_truncated(tmp_path):
     assert meta["truncated"] and meta["total_seen"] == 8
 
 
-def test_pcapng_rejected(tmp_path):
+def write_pcapng(path, records):
+    def block(btype, body):
+        body += b"\x00" * (-len(body) % 4)
+        return struct.pack("<II", btype, 12 + len(body)) + body + struct.pack("<I", 12 + len(body))
+    out = block(0x0A0D0D0A, struct.pack("<IHHq", 0x1A2B3C4D, 1, 0, -1))
+    out += block(1, struct.pack("<HHI", 1, 0, 65535))
+    for sec, frac, data in records:
+        t = sec * 1_000_000 + frac
+        out += block(6, struct.pack("<IIIII", 0, t >> 32, t & 0xFFFFFFFF, len(data), len(data)) + data)
+    path.write_bytes(out)
+
+
+@pytest.mark.parametrize("n_threads", [1, 3])
+def test_pcapng_matches_pcap(tmp_path, n_threads):
+    a, b = tmp_path / "t.pcap", tmp_path / "t.pcapng"
+    write_pcap(a, RECORDS)
+    write_pcapng(b, RECORDS)
+    ca, ma = sf.read_pcap_columns(str(a), n_threads=n_threads)
+    cb, mb = sf.read_pcap_columns(str(b), n_threads=n_threads)
+    assert mb["format"] == "pcapng" and mb["reference_error"] is None
+    assert ma["dropped"] == mb["dropped"] and ma["total_seen"] == mb["total_seen"]
+    for c in COLS:
+        assert ca[c].tobytes() == cb[c].tobytes(), c
+
+
+def test_pcapng_bad_header_rejected(tmp_path):
     p = tmp_path / "t.pcapng"
     p.write_bytes(b"\x0a\x0d\x0d\x0a" + b"\x00" * 28)
     with pytest.raises(OSError, match="pcapng"):

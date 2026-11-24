@@ -4029,7 +4029,7 @@ fn rdpcap(filename: &str, count: usize) -> PyResult<Vec<PyPcapPacket>> {
     Ok(results)
 }
 
-/// Read a classic pcap into a columnar IPv4 TCP/UDP/ICMP packet table, in parallel.
+/// Read a classic pcap or pcapng file into a columnar IPv4 TCP/UDP/ICMP packet table, in parallel.
 ///
 /// The file is memory-mapped, its record headers are walked once, and chunks
 /// of records are decoded on a private pool of `n_threads` worker threads
@@ -4039,7 +4039,10 @@ fn rdpcap(filename: &str, count: usize) -> PyResult<Vec<PyPcapPacket>> {
 /// `payload = max(0, ip_len - ihl - l4hdr)`; `ts_us = round(ts * 1e6)`).
 ///
 /// Args:
-///     path: Path to a classic pcap file (micro/nanosecond, either byte order).
+///     path: Classic pcap (micro/nanosecond, either byte order) or pcapng. pcapng is
+///         read exactly as dpkt.pcapng.Reader does: first section's byte order,
+///         first IDB's link type / if_tsresol / if_tsoffset for all packets,
+///         only Enhanced and (obsolete) Packet blocks.
 ///     n_threads: Worker threads (default: all CPUs available to the process).
 ///     chunk_mb: Capture megabytes per parallel work item.
 ///     release_pages: Unmap file pages after each chunk is decoded (keeps RSS
@@ -4052,11 +4055,14 @@ fn rdpcap(filename: &str, count: usize) -> PyResult<Vec<PyPcapPacket>> {
 ///     win uint16, icmp_type uint8, icmp_code uint8) to 1-D numpy arrays in
 ///     capture order. `meta` holds `dropped` (dict: non_ip, ipv6, other_l4,
 ///     fragment, parse_error), `total_seen`, `truncated`, `truncation`,
-///     `linktype`, `ts_resolution`, `bytes_consumed`, `file_size`,
+///     `reference_error` (where dpkt would raise instead: classic record
+///     header cut by EOF, malformed/truncated pcapng packet block; the table
+///     holds the packets before it), `format`, `linktype`, `ts_resolution`,
+///     `ts_divisor`, `bytes_consumed`, `file_size`,
 ///     `n_chunks`, `chunks_redecoded`, `n_threads`.
 ///
 /// Raises:
-///     IOError: unreadable file, bad magic, or pcapng input.
+///     IOError: unreadable file, bad magic, or a pcapng header dpkt rejects.
 #[pyfunction]
 #[pyo3(signature = (path, n_threads=None, chunk_mb=8, release_pages=true))]
 fn read_pcap_columns<'py>(
@@ -4104,7 +4110,17 @@ fn read_pcap_columns<'py>(
     meta.set_item("truncated", t.truncated)?;
     meta.set_item("truncation", t.truncation)?;
     meta.set_item("linktype", t.linktype)?;
-    meta.set_item("ts_resolution", if t.nanosecond { "ns" } else { "us" })?;
+    meta.set_item("format", if t.pcapng { "pcapng" } else { "pcap" })?;
+    meta.set_item("reference_error", t.reference_error)?;
+    let res = if t.ts_divisor == 1e6 {
+        "us".to_string()
+    } else if t.ts_divisor == 1e9 {
+        "ns".to_string()
+    } else {
+        format!("1/{}", t.ts_divisor)
+    };
+    meta.set_item("ts_resolution", res)?;
+    meta.set_item("ts_divisor", t.ts_divisor)?;
     meta.set_item("bytes_consumed", t.bytes_consumed)?;
     meta.set_item("file_size", t.file_size)?;
     meta.set_item("n_chunks", t.n_chunks)?;

@@ -1,4 +1,4 @@
-//! Parallel, columnar classic-PCAP reader producing a flow-feature packet table.
+//! Parallel, columnar PCAP / pcapng reader producing a flow-feature packet table.
 //!
 //! [`read_pcap_columns`] memory-maps a capture, cuts it into byte ranges and
 //! decodes the ranges in parallel on a private Rayon pool (classic PCAP has
@@ -179,10 +179,19 @@ pub struct PacketTable {
     pub truncated: bool,
     /// Human-readable description of the truncation, if any.
     pub truncation: Option<String>,
-    /// Link type from the global header.
+    /// Set where the reference reader (dpkt) would raise instead of returning
+    /// a table: a classic-pcap record header cut by end-of-file, or a
+    /// malformed/truncated pcapng packet block. The table holds the packets
+    /// before that point.
+    pub reference_error: Option<String>,
+    /// The input is pcapng (otherwise classic pcap).
+    pub pcapng: bool,
+    /// Link type (classic: global header; pcapng: first IDB).
     pub linktype: u32,
-    /// Timestamps in the file are nanoseconds (otherwise microseconds).
+    /// Classic pcap with nanosecond timestamps.
     pub nanosecond: bool,
+    /// Timestamp ticks per second (pcapng: from the first IDB's if_tsresol).
+    pub ts_divisor: f64,
     /// Byte offset where decoding stopped (== file size for a complete file).
     pub bytes_consumed: u64,
     /// File size in bytes.
@@ -278,13 +287,6 @@ fn parse_global_header(raw: &[u8]) -> Result<Format> {
         0xD4C3_B2A1 => (true, false, 16),
         0x4D3C_B2A1 => (true, true, 16),
         0x34CD_B2A1 => (true, false, 24),
-        0x0A0D_0D0A => {
-            return Err(PacketError::Io(
-                "pcapng is not supported by read_pcap_columns (classic pcap only); convert with \
-                 `editcap -F pcap in.pcapng out.pcap` or use PcapReader"
-                    .into(),
-            ));
-        },
         _ => {
             return Err(PacketError::Io(format!("invalid pcap magic {magic:#010x}")));
         },
@@ -784,6 +786,8 @@ struct ChunkOut {
     dropped: DropCounts,
     seen: u64,
     truncation: Option<String>,
+    /// The reference reader (dpkt) raises at this point.
+    ref_error: Option<String>,
 }
 
 /// Records whose header starts in `[start, stop)`, following the chain from `start`.
@@ -792,6 +796,7 @@ fn decode_range(raw: &[u8], fmt: Format, start: usize, stop: usize) -> ChunkOut 
     let mut cols = PacketColumns::with_capacity(cap);
     let mut dropped = DropCounts::default();
     let mut truncation = None;
+    let mut ref_error = None;
     let mut off = start;
     let mut seen = 0u64;
     let h = fmt.rec_hdr_len;
@@ -801,6 +806,7 @@ fn decode_range(raw: &[u8], fmt: Format, start: usize, stop: usize) -> ChunkOut 
             truncation = Some(format!(
                 "capture ends inside a record header at offset {off} ({rem} of {h} bytes)"
             ));
+            ref_error = truncation.clone(); // dpkt.pcap.Reader raises NeedData
             break;
         }
         let sec = rd32(raw, off, fmt.little);
@@ -838,6 +844,7 @@ fn decode_range(raw: &[u8], fmt: Format, start: usize, stop: usize) -> ChunkOut 
         dropped,
         seen,
         truncation,
+        ref_error,
     }
 }
 
@@ -887,6 +894,389 @@ fn resync(
         return Some(o);
     }
     None
+}
+
+// ---------------------------------------------------------------------------
+// pcapng, as dpkt 1.9.8's `dpkt.pcapng.Reader` reads it
+// ---------------------------------------------------------------------------
+//
+// dpkt's reader is much narrower than the pcapng spec, and the reference
+// table follows it, so this does too (the crate's spec-conforming pcapng
+// reader in `reader.rs` is therefore not reused for the table):
+//   * the byte order of the FIRST section header applies to the whole file
+//     (later SHBs are skipped like any other block);
+//   * the FIRST interface description block gives the link type, the
+//     timestamp divisor (`if_tsresol`, default 1e6) and `if_tsoffset` for
+//     every packet; `iface_id` and later IDBs are ignored;
+//   * only Enhanced (6) and obsolete Packet (2) blocks are yielded; Simple
+//     Packet, Interface Statistics, ... blocks and any packet block before
+//     the first IDB are skipped;
+//   * ts = if_tsoffset + ((ts_high << 32) | ts_low) / divisor (float);
+//   * a malformed or truncated packet block raises (the whole read fails);
+//     fewer than 8 trailing bytes end the file silently.
+
+/// Global state fixed by the section header and the first IDB.
+#[derive(Debug, Clone, Copy)]
+struct NgFormat {
+    le: bool,
+    divisor: f64,
+    tsoffset: i64,
+    linktype: u32,
+    /// Offset of the first block after the first IDB.
+    first: usize,
+    /// Seconds of the first packet block (resync plausibility only).
+    sec_ref: Option<f64>,
+}
+
+#[inline]
+fn rd16(b: &[u8], off: usize, little: bool) -> u16 {
+    let a = [b[off], b[off + 1]];
+    if little {
+        u16::from_le_bytes(a)
+    } else {
+        u16::from_be_bytes(a)
+    }
+}
+
+/// End offset of `f.read(n)` issued at `pos` (a negative `n` reads to EOF).
+#[inline]
+fn py_read_end(len: usize, pos: usize, n: i64) -> usize {
+    if n < 0 {
+        len
+    } else {
+        (pos as u64).saturating_add(n as u64).min(len as u64) as usize
+    }
+}
+
+/// Python `b[start:end]` with possibly negative bounds.
+#[inline]
+fn pyslice_i(b: &[u8], start: i64, end: i64) -> &[u8] {
+    let n = b.len() as i64;
+    let norm = |x: i64| if x < 0 { (x + n).max(0) } else { x.min(n) };
+    let (s, e) = (norm(start), norm(end));
+    if s >= e {
+        &[]
+    } else {
+        &b[s as usize..e as usize]
+    }
+}
+
+/// `_PcapngBlock._do_unpack_options(buf, oo)`: calls `on_opt` per option, or
+/// returns the reason dpkt raises.
+fn ng_options<'a>(
+    buf: &'a [u8],
+    oo: i64,
+    len: i64,
+    le: bool,
+    mut on_opt: impl FnMut(u16, &'a [u8]),
+) -> std::result::Result<(), &'static str> {
+    let ol = len - oo - 4;
+    let mut ob = pyslice_i(buf, oo, oo + ol);
+    while !ob.is_empty() {
+        if ob.len() < 4 {
+            return Err("option header cut short");
+        }
+        let code = rd16(ob, 0, le);
+        let data = pyslice(ob, 4, 4 + usize::from(rd16(ob, 2, le)));
+        if code == 1 && std::str::from_utf8(data).is_err() {
+            // dpkt: utf-8, else ascii up to the first NUL, else raise.
+            match data.iter().position(|&c| c == 0) {
+                Some(i) if data[..i].is_ascii() => {},
+                _ => return Err("comment option is not valid UTF-8"),
+            }
+        }
+        on_opt(code, data);
+        ob = tail(ob, 4 + data.len().div_ceil(4) * 4);
+        if code == 0 {
+            break;
+        }
+    }
+    if buf.len() < 4 {
+        return Err("block shorter than 4 bytes");
+    }
+    if i64::from(rd32(buf, buf.len() - 4, le)) != len {
+        return Err("length fields do not match");
+    }
+    Ok(())
+}
+
+const NG_PAST_EOF: &str = "packet block runs past end of file";
+
+/// `EnhancedPacketBlock(buf)` / `PacketBlock(buf)`: (timestamp ticks, packet data).
+#[inline]
+fn ng_packet(buf: &[u8], le: bool) -> std::result::Result<(u64, &[u8]), &'static str> {
+    if buf.len() < 32 {
+        return Err("packet block shorter than its 32-byte header");
+    }
+    let len = i64::from(rd32(buf, 4, le));
+    if len > buf.len() as i64 {
+        return Err(NG_PAST_EOF);
+    }
+    let caplen = rd32(buf, 20, le) as usize;
+    let pkt = pyslice(buf, 28, 28 + caplen);
+    let oo = 28 + (caplen as i64 + 3) / 4 * 4;
+    ng_options(buf, oo, len, le, |_, _| {})?;
+    let t = (u64::from(rd32(buf, 12, le)) << 32) | u64::from(rd32(buf, 16, le));
+    Ok((t, pkt))
+}
+
+/// `dpkt.pcapng.Reader.__init__`: errors are the cases where it raises.
+fn parse_pcapng_header(raw: &[u8]) -> Result<NgFormat> {
+    let rej = |m: &str| {
+        PacketError::Io(format!(
+            "pcapng: rejected (dpkt.pcapng.Reader raises too): {m}"
+        ))
+    };
+    if raw.len() < 28 {
+        return Err(rej("file shorter than a section header block"));
+    }
+    let le = match be32(raw, 8) {
+        0x1A2B_3C4D => false,
+        0x4D3C_2B1A => true,
+        _ => return Err(rej("unknown byte-order magic")),
+    };
+    let len = i64::from(rd32(raw, 4, le));
+    let end = py_read_end(raw.len(), 28, len - 28);
+    let shb = &raw[..end];
+    if len > shb.len() as i64 {
+        return Err(rej("section header block runs past end of file"));
+    }
+    ng_options(shb, 24, len, le, |_, _| {}).map_err(rej)?;
+    if rd16(raw, 12, le) != 1 {
+        return Err(rej("unsupported pcapng major version"));
+    }
+    let mut pos = end;
+    loop {
+        if raw.len() - pos < 8 {
+            return Err(rej("IDB not found"));
+        }
+        let bt = rd32(raw, pos, le);
+        let e = py_read_end(raw.len(), pos + 8, i64::from(rd32(raw, pos + 4, le)) - 8);
+        let buf = &raw[pos..e];
+        pos = e;
+        if bt != 1 {
+            continue;
+        }
+        if buf.len() < 20 {
+            return Err(rej("interface description block shorter than its header"));
+        }
+        let len = i64::from(rd32(buf, 4, le));
+        if len > buf.len() as i64 {
+            return Err(rej("interface description block runs past end of file"));
+        }
+        let (mut divisor, mut tsoffset, mut bad) = (1e6f64, 0i64, None);
+        ng_options(buf, 16, len, le, |code, data| match code {
+            9 if data.len() != 1 => bad = Some("if_tsresol option is not 1 byte"),
+            9 => {
+                let e = i32::from(data[0] & 0x7f);
+                divisor = if data[0] & 0x80 != 0 {
+                    2f64.powi(e)
+                } else {
+                    // float(10 ** e), correctly rounded
+                    format!("1e{e}").parse().unwrap_or(f64::INFINITY)
+                };
+            },
+            14 if data.len() != 8 => bad = Some("if_tsoffset option is not 8 bytes"),
+            14 => {
+                let a: [u8; 8] = data.try_into().unwrap_or([0; 8]);
+                tsoffset = if le {
+                    i64::from_le_bytes(a)
+                } else {
+                    i64::from_be_bytes(a)
+                };
+            },
+            _ => {},
+        })
+        .map_err(rej)?;
+        if let Some(m) = bad {
+            return Err(rej(m));
+        }
+        let mut ng = NgFormat {
+            le,
+            divisor,
+            tsoffset,
+            linktype: u32::from(rd16(buf, 8, le)),
+            first: pos,
+            sec_ref: None,
+        };
+        // First packet block's time, for the resync plausibility test.
+        let mut p = pos;
+        for _ in 0..10_000 {
+            if raw.len() - p < 8 {
+                break;
+            }
+            let bt = rd32(raw, p, le);
+            let e = py_read_end(raw.len(), p + 8, i64::from(rd32(raw, p + 4, le)) - 8);
+            if bt == 6 || bt == 2 {
+                if let Ok((t, _)) = ng_packet(&raw[p..e], le) {
+                    ng.sec_ref = Some(ng.ts_secs(t));
+                }
+                break;
+            }
+            p = e;
+        }
+        return Ok(ng);
+    }
+}
+
+impl NgFormat {
+    #[inline]
+    fn ts_secs(&self, t: u64) -> f64 {
+        // Python: int + int/float  ->  float(tsoffset) + float(t)/divisor
+        self.tsoffset as f64 + (t as f64) / self.divisor
+    }
+}
+
+/// Blocks starting in `[start, stop)`, following dpkt's block chain from `start`.
+fn decode_range_ng(raw: &[u8], ng: NgFormat, start: usize, stop: usize) -> ChunkOut {
+    let cap = (stop.saturating_sub(start)) / 64 + 16;
+    let mut cols = PacketColumns::with_capacity(cap);
+    let mut dropped = DropCounts::default();
+    let (mut truncation, mut ref_error) = (None, None);
+    let mut off = start;
+    let mut seen = 0u64;
+    while off < stop {
+        let rem = raw.len() - off;
+        if rem < 8 {
+            truncation = Some(format!(
+                "{rem} trailing bytes after the last block at offset {off} (ignored, as dpkt does)"
+            ));
+            break;
+        }
+        let bt = rd32(raw, off, ng.le);
+        let e = py_read_end(raw.len(), off + 8, i64::from(rd32(raw, off + 4, ng.le)) - 8);
+        if bt == 6 || bt == 2 {
+            match ng_packet(&raw[off..e], ng.le) {
+                Ok((t, pkt)) => {
+                    seen += 1;
+                    match classify(pkt, ng.linktype) {
+                        Outcome::Row(r) => {
+                            let f = (ng.ts_secs(t) * 1_000_000.0).round_ties_even();
+                            if !(-9.223_372_036_854_776e18..9.223_372_036_854_776e18).contains(&f) {
+                                ref_error = Some(format!(
+                                    "timestamp of the packet block at offset {off} does not fit \
+                                     int64 microseconds (the reference table cannot hold it)"
+                                ));
+                                break;
+                            }
+                            cols.push(f as i64, &r);
+                        },
+                        Outcome::NonIp => dropped.non_ip += 1,
+                        Outcome::Ipv6 => dropped.ipv6 += 1,
+                        Outcome::OtherL4 => dropped.other_l4 += 1,
+                        Outcome::Fragment => dropped.fragment += 1,
+                        Outcome::ParseError => dropped.parse_error += 1,
+                    }
+                },
+                Err(m) => {
+                    let msg =
+                        format!("{m} (block at offset {off}); dpkt.pcapng.Reader raises here");
+                    if m == NG_PAST_EOF {
+                        truncation = Some(msg.clone());
+                    }
+                    ref_error = Some(msg);
+                    break;
+                },
+            }
+        }
+        off = e;
+    }
+    ChunkOut {
+        start,
+        end: off,
+        cols,
+        dropped,
+        seen,
+        truncation,
+        ref_error,
+    }
+}
+
+/// Block at `p` looks real (trailing length copy matches, sane fields).
+#[inline]
+fn plausible_ng(raw: &[u8], ng: NgFormat, p: usize) -> Option<usize> {
+    if raw.len() - p < 12 {
+        return None;
+    }
+    let bt = rd32(raw, p, ng.le);
+    let bl = rd32(raw, p + 4, ng.le) as usize;
+    if bl < 12 || bl % 4 != 0 || bl > raw.len() - p || rd32(raw, p + bl - 4, ng.le) as usize != bl {
+        return None;
+    }
+    match bt {
+        6 | 2 => {
+            if bl < 32 || rd32(raw, p + 20, ng.le) as usize > bl - 32 {
+                return None;
+            }
+            if let Some(r) = ng.sec_ref {
+                let t = (u64::from(rd32(raw, p + 12, ng.le)) << 32)
+                    | u64::from(rd32(raw, p + 16, ng.le));
+                if (ng.ts_secs(t) - r).abs() > 400.0 * 86_400.0 {
+                    return None;
+                }
+            }
+        },
+        1 | 3 | 4 | 5 | 7 | 0x0A0D_0D0A => {},
+        _ => return None,
+    }
+    Some(p + bl)
+}
+
+fn resync_ng(raw: &[u8], ng: NgFormat, from: usize, to: usize) -> Option<usize> {
+    // Candidates share the first block's alignment (blocks are 4-byte multiples).
+    let from = from + (ng.first % 4 + 4 - from % 4) % 4;
+    'cand: for o in (from..to).step_by(4) {
+        let mut p = o;
+        for _ in 0..8 {
+            if p == raw.len() {
+                break;
+            }
+            match plausible_ng(raw, ng, p) {
+                Some(n) => p = n,
+                None => continue 'cand,
+            }
+        }
+        return Some(o);
+    }
+    None
+}
+
+/// Container-specific parts of the driver.
+#[derive(Debug, Clone, Copy)]
+enum Container {
+    Pcap {
+        fmt: Format,
+        cap_max: usize,
+        sec_ref: u32,
+    },
+    Ng(NgFormat),
+}
+
+impl Container {
+    fn first(&self) -> usize {
+        match self {
+            Self::Pcap { .. } => 24,
+            Self::Ng(ng) => ng.first,
+        }
+    }
+
+    fn decode(&self, raw: &[u8], start: usize, stop: usize) -> ChunkOut {
+        match *self {
+            Self::Pcap { fmt, .. } => decode_range(raw, fmt, start, stop),
+            Self::Ng(ng) => decode_range_ng(raw, ng, start, stop),
+        }
+    }
+
+    fn resync(&self, raw: &[u8], from: usize, to: usize) -> Option<usize> {
+        match *self {
+            Self::Pcap {
+                fmt,
+                cap_max,
+                sec_ref,
+            } => resync(raw, fmt, from, to, cap_max, sec_ref),
+            Self::Ng(ng) => resync_ng(raw, ng, from, to),
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -939,7 +1329,7 @@ fn concat<T: Copy + Send + Sync>(
     out
 }
 
-/// Read a classic pcap into the 13-column packet table (see module docs).
+/// Read a classic pcap or pcapng file into the 13-column packet table (see module docs).
 pub fn read_pcap_columns(path: impl AsRef<Path>, n_threads: Option<usize>) -> Result<PacketTable> {
     read_pcap_columns_with(
         path,
@@ -962,13 +1352,26 @@ pub fn read_pcap_columns_with(
     let mmap = unsafe { Mmap::map(&file) }
         .map_err(|e| PacketError::Io(format!("failed to mmap {}: {e}", path.display())))?;
     let raw: &[u8] = &mmap;
-    let fmt = parse_global_header(raw)?;
-    let snaplen = rd32(raw, 16, fmt.little) as usize;
-    let cap_max = if (1..=(1 << 20)).contains(&snaplen) {
-        snaplen.max(65_535)
+    let cont = if raw.len() >= 4 && be32(raw, 0) == 0x0A0D_0D0A {
+        Container::Ng(parse_pcapng_header(raw)?)
     } else {
-        262_144
+        let fmt = parse_global_header(raw)?;
+        let snaplen = rd32(raw, 16, fmt.little) as usize;
+        Container::Pcap {
+            fmt,
+            cap_max: if (1..=(1 << 20)).contains(&snaplen) {
+                snaplen.max(65_535)
+            } else {
+                262_144
+            },
+            sec_ref: if raw.len() >= 28 {
+                rd32(raw, 24, fmt.little)
+            } else {
+                0
+            },
+        }
     };
+    let first = cont.first();
 
     let n_threads = opts
         .n_threads
@@ -985,15 +1388,10 @@ pub fn read_pcap_columns_with(
 
     // Byte ranges [bounds[i], bounds[i+1]).
     let chunk_bytes = opts.chunk_bytes.max(1 << 16);
-    let mut bounds: Vec<usize> = (24..raw.len()).step_by(chunk_bytes).collect();
+    let mut bounds: Vec<usize> = (first..raw.len()).step_by(chunk_bytes).collect();
     bounds.push(raw.len());
     let n_ranges = bounds.len() - 1;
 
-    let sec_ref = if raw.len() >= 28 {
-        rd32(raw, 24, fmt.little)
-    } else {
-        0
-    };
     // Workers take chunks in file order (atomic counter) so that all threads
     // read neighbouring regions: friendlier to readahead on a cold cache than
     // rayon's recursive range splitting.
@@ -1012,9 +1410,9 @@ pub fn read_pcap_columns_with(
                     let st = if i == 0 {
                         Some(a)
                     } else {
-                        resync(raw, fmt, a, b, cap_max, sec_ref)
+                        cont.resync(raw, a, b)
                     };
-                    let out = st.map(|st| decode_range(raw, fmt, st, b));
+                    let out = st.map(|st| cont.decode(raw, st, b));
                     if opts.release_pages {
                         release(&mmap, a, b);
                     }
@@ -1030,38 +1428,23 @@ pub fn read_pcap_columns_with(
     let t_decode = t0.elapsed().as_secs_f64();
 
     // Verify the chain; re-decode chunks that started at the wrong offset.
-    let mut expected = 24usize;
+    let mut expected = first;
     let mut redone = 0usize;
     let mut truncation: Option<String> = None;
+    let mut reference_error: Option<String> = None;
     for i in 0..n_ranges {
-        if truncation.is_some() || expected >= raw.len() {
+        if truncation.is_some() || reference_error.is_some() || expected >= raw.len() {
             parts[i] = None;
             continue;
         }
         if !matches!(&parts[i], Some(c) if c.start == expected) {
-            if timing && redone < 8 {
-                let got = parts[i].as_ref().map(|c| c.start);
-                let why = (0..8).try_fold(expected, |p, _| {
-                    if p == raw.len() {
-                        Ok(p)
-                    } else {
-                        plausible(raw, fmt, p, cap_max, sec_ref).ok_or(p)
-                    }
-                });
-                eprintln!(
-                    "  chunk {i}: range start {} resync {got:?} expected {expected} chain-from-expected {why:?} hdr@fail {:?}",
-                    bounds[i],
-                    why.err().map(|p| (0..4)
-                        .map(|k| rd32(raw, p + 4 * k, fmt.little))
-                        .collect::<Vec<_>>())
-                );
-            }
-            parts[i] = Some(decode_range(raw, fmt, expected, bounds[i + 1]));
+            parts[i] = Some(cont.decode(raw, expected, bounds[i + 1]));
             redone += 1;
         }
         let c = parts[i].as_mut().expect("chunk present");
         expected = c.end;
         truncation = c.truncation.take();
+        reference_error = c.ref_error.take();
     }
     let mut parts: Vec<ChunkOut> = parts.into_iter().flatten().collect();
     let t_verify = t0.elapsed().as_secs_f64();
@@ -1103,8 +1486,23 @@ pub fn read_pcap_columns_with(
         total_seen: seen,
         truncated: truncation.is_some(),
         truncation,
-        linktype: fmt.linktype,
-        nanosecond: fmt.nano,
+        reference_error,
+        pcapng: matches!(cont, Container::Ng(_)),
+        linktype: match cont {
+            Container::Pcap { fmt, .. } => fmt.linktype,
+            Container::Ng(ng) => ng.linktype,
+        },
+        nanosecond: matches!(cont, Container::Pcap { fmt, .. } if fmt.nano),
+        ts_divisor: match cont {
+            Container::Pcap { fmt, .. } => {
+                if fmt.nano {
+                    1e9
+                } else {
+                    1e6
+                }
+            },
+            Container::Ng(ng) => ng.divisor,
+        },
         bytes_consumed: expected.min(raw.len()) as u64,
         file_size: raw.len() as u64,
         n_chunks: n_ranges,
@@ -1354,8 +1752,100 @@ mod tests {
         assert_eq!(t.total_seen, serial.seen);
     }
 
+    fn ng_block(btype: u32, body: &[u8]) -> Vec<u8> {
+        let mut body = body.to_vec();
+        while body.len() % 4 != 0 {
+            body.push(0);
+        }
+        let n = (12 + body.len()) as u32;
+        let mut v = btype.to_le_bytes().to_vec();
+        v.extend_from_slice(&n.to_le_bytes());
+        v.extend_from_slice(&body);
+        v.extend_from_slice(&n.to_le_bytes());
+        v
+    }
+
+    fn ng_pkt(btype: u32, ticks: u64, data: &[u8]) -> Vec<u8> {
+        let mut b = Vec::new();
+        if btype == 2 {
+            b.extend_from_slice(&[0, 0, 0, 0]); // iface_id u16 + drops u16
+        } else {
+            b.extend_from_slice(&0u32.to_le_bytes());
+        }
+        b.extend_from_slice(&((ticks >> 32) as u32).to_le_bytes());
+        b.extend_from_slice(&(ticks as u32).to_le_bytes());
+        b.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        b.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        b.extend_from_slice(data);
+        while b.len() % 4 != 0 {
+            b.push(0);
+        }
+        ng_block(btype, &b)
+    }
+
+    fn ng_file(n: u32) -> Vec<u8> {
+        let mut shb = 0x1A2B_3C4Du32.to_le_bytes().to_vec();
+        shb.extend_from_slice(&[1, 0, 0, 0]);
+        shb.extend_from_slice(&(-1i64).to_le_bytes());
+        let mut f = ng_block(0x0A0D_0D0A, &shb);
+        let udp = eth(0x0800, &ipv4(17, &[0, 1, 0, 2, 0, 8, 0, 0], 0));
+        f.extend(ng_pkt(6, 5, &udp)); // before the first IDB: skipped
+        let mut idb = vec![1, 0, 0, 0, 0xff, 0xff, 0, 0];
+        idb.extend_from_slice(&[9, 0, 1, 0, 9, 0, 0, 0]); // if_tsresol = 9 (ns)
+        idb.extend_from_slice(&[14, 0, 8, 0]);
+        idb.extend_from_slice(&100i64.to_le_bytes()); // if_tsoffset = 100 s
+        idb.extend_from_slice(&[0, 0, 0, 0]);
+        f.extend(ng_block(1, &idb));
+        f.extend(ng_block(1, &[101, 0, 0, 0, 0xff, 0xff, 0, 0])); // 2nd IDB: ignored
+        for i in 0..n {
+            let ticks = 1_519_000_000_000_000_000 + u64::from(i) * 1_500;
+            let pl = tcp(1000 + (i % 7) as u16, 80, 0x18, 1024, (i % 300) as usize);
+            f.extend(ng_pkt(6, ticks, &eth(0x0800, &ipv4(6, &pl, 0))));
+            if i % 50 == 0 {
+                f.extend(ng_block(3, &[0u8; 40])); // SPB: ignored
+                f.extend(ng_pkt(2, ticks, &udp)); // obsolete PB: yielded
+            }
+        }
+        f
+    }
+
     #[test]
-    fn pcapng_is_rejected() {
+    fn pcapng_dpkt_semantics_and_parallel_chunks() {
+        let bytes = ng_file(30_000);
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("t.pcapng");
+        std::fs::write(&p, &bytes).unwrap();
+        let ng = parse_pcapng_header(&bytes).unwrap();
+        assert_eq!((ng.divisor, ng.tsoffset, ng.linktype), (1e9, 100, 1));
+        let serial = decode_range_ng(&bytes, ng, ng.first, bytes.len());
+        assert_eq!(serial.seen, 30_000 + 600);
+        // ts = 100 + 1519000000000000000 / 1e9 (float), in microseconds
+        let want =
+            ((100.0 + 1_519_000_000_000_000_000u64 as f64 / 1e9) * 1e6).round_ties_even() as i64;
+        assert_eq!(serial.cols.ts_us[0], want);
+        for threads in [1, 3] {
+            let t = read_pcap_columns_with(
+                &p,
+                ColumnReaderOptions {
+                    n_threads: Some(threads),
+                    chunk_bytes: 65_536,
+                    release_pages: true,
+                },
+            )
+            .unwrap();
+            assert!(t.pcapng && t.n_chunks > 20 && t.reference_error.is_none());
+            assert_eq!(t.columns, serial.cols);
+            assert_eq!(t.total_seen, serial.seen);
+        }
+        // Cut inside the last block: dpkt raises; rows before are kept.
+        std::fs::write(&p, &bytes[..bytes.len() - 6]).unwrap();
+        let t = read_pcap_columns(&p, Some(2)).unwrap();
+        assert!(t.truncated && t.reference_error.is_some());
+        assert_eq!(t.total_seen, serial.seen - 1);
+    }
+
+    #[test]
+    fn pcapng_bad_header_is_rejected() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("t.pcapng");
         let mut b = vec![0x0A, 0x0D, 0x0D, 0x0A];

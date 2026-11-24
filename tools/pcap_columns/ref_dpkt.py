@@ -71,8 +71,8 @@ if __name__ == "__main__":
     t0 = time.time(); err = None
     if mode == "offwire":
         sys.path.insert(0, os.environ["OFFWIRE_ROOT"])
-        from offwire.pcap import read_pcap
-        df = read_pcap(path); d = {c: df[c].to_numpy() for c in COLS}; drop, total = df.attrs["dropped"], df.attrs["total_seen"]
+        import offwire.pcap as ow
+        df = (ow.read_pcap_dpkt if hasattr(ow, "read_pcap_dpkt") else ow.read_pcap)(path); d = {c: df[c].to_numpy() for c in COLS}; drop, total = df.attrs["dropped"], df.attrs["total_seen"]
     else:
         d, drop, total, err = read_loop(path)
     dt = time.time() - t0
